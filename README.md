@@ -1,10 +1,3 @@
--Nome ALUNO A- Pedro Correia
--Nome ALUNO B- Filipe Pereira
--IPLEIRIA - Instituto Politécnico de Leiria
--ESTG - Escola Superior de Tecnologia e Gestão
--LEAU- Licenciatura em Engenharia Automóvel
--SEEV - Sistemas Elétricos e Eletrónicos de Veículos
-
 Este projeto tem como objetivo simular uma porta OBD-II de um veículo utilizando dois microcontroladores ESP32. Um dos ESP32 funcionará como a unidade de simulação do veículo ("OBD/ECU"), realizando a leitura de vários sensores reais, enquanto o segundo ESP32 funcionará como um dispositivo de diagnóstico com ecrã (scanner OBD), capaz de receber, interpretar e apresentar os dados recolhidos. Através de uma comunicação CAN BUS entre os dois microcontroladores, utilizando transceivers externos. Os valores de temperatura, pressão e posição de um potenciómetro serão enviados para o módulo de visualização. O objetivo é reproduzir o funcionamento de um leitor OBD, mas totalmente implementado com hardware personalizado.
 
 LINK: https://youtu.be/ADrQqGyQzoY
