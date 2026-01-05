@@ -49,7 +49,7 @@ TFT_22_ILI9225 tft = TFT_22_ILI9225(TFT_RST, TFT_CD, TFT_CS, TFT_SDI, TFT_CLK, T
 #define SENDER_TIMEOUT_MS 2000
 
 // ---------------------- Limiares de alerta ----------------------
-#define WARN_TEMP_C_THRESHOLD           16.0f
+#define WARN_TEMP_C_THRESHOLD           20.0f
 #define WARN_PRESSURE_BAR_MIN           1.2f
 #define WARN_THROTTLE_PCT_FOR_PRESSURE  40.0f
 
@@ -102,7 +102,7 @@ static uint8_t g_warnMask = 0;
 
 // Auxiliares de cor
 static uint16_t tempColor(float tempC) {
-  if (tempC >= 16.0f) return COLOR_RED;
+  if (tempC >= 20.0f) return COLOR_RED;
   if (tempC >= 15.0f) return COLOR_GREEN;
   return COLOR_BLUE;
 }
@@ -213,7 +213,7 @@ static void drawRunValues(float tempC, float pressBar, float thrPct, uint8_t war
   drawThrottleBar(thrPct);
 }
 
-//Tarefa B1 – Receção e Descodificação CAN 
+//Tarefa B1 – Receção e Descodificação CAN
 static void TaskB1_CanRx(void *parameter)
 {
   (void)parameter;
@@ -233,7 +233,7 @@ static void TaskB1_CanRx(void *parameter)
   }
 }
 
-// Tarefa B2 – Processamento dos Dados Recebidos  
+// Tarefa B2 – Processamento dos Dados Recebidos
 static void TaskB2_Process(void *parameter)
 {
   (void)parameter;
@@ -280,7 +280,7 @@ static void TaskB2_Process(void *parameter)
   }
 }
 
-// Atualização do Display (ILI9341)  
+// Atualização do Display (ILI9341)
 static void TaskB3_Display(void *parameter)
 {
   (void)parameter;
@@ -315,7 +315,7 @@ static void TaskB3_Display(void *parameter)
   }
 }
 
-// Sistema de Avisos e Limiarização  
+// Sistema de Avisos e Limiarização
 static void TaskB4_Alerts(void *parameter)
 {
   (void)parameter;
