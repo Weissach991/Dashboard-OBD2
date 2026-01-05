@@ -1,0 +1,422 @@
+/*
+  ESP32 A – Simulador OBD/ECU
+
+  Tarefas (conforme o enunciado/write-up):
+    A1: Temperatura (500 ms) prioridade 1
+    A2: Pressão (500 ms, com desfasamento inicial) prioridade 1
+    A3: Acelerador (100 ms) prioridade 2
+    A4: CAN TX (100 ms) prioridade 3
+
+  Extras:
+    AX: buzzer até existir ignição
+    AY: LEDs (vermelho pisca sem ignição, azul ligado com ignição)
+*/
+
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp32_can.h"
+#include <limits.h>
+#include <math.h>
+
+// ----------------------
+// Definição de pinos
+// ----------------------
+#define IGNITION_SWITCH_PIN     18   // Botão/interruptor de ignição
+#define BUZZER_PIN              19   // Buzzer
+#define IGNITION_LED_RED_PIN    22   // LED vermelho
+#define RUN_LED_BLUE_PIN        1    // LED azul
+#define RED_BLINK_PERIOD_MS     400  // Período de pisca do LED vermelho
+
+// ----------------------
+// Buzzer via LEDC (PWM/tonalidade)
+// ----------------------
+#define BUZZER_LEDC_RES         10   // Resolução do canal LEDC
+#define BUZZER_DUTY_ON          512  // Duty ligado
+
+// ----------------------
+// DS18B20 (temperatura)
+// ----------------------
+#define ONE_WIRE_BUS 23
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// ----------------------
+// Sensor de pressão (analógico)
+// ----------------------
+const int sensorPin = 34;            // ADC
+const float R1 = 44000.0;            // Resistência do divisor (topo)
+const float R2 = 100000.0;           // Resistência do divisor (base)
+const float undoRatio = (R1 + R2) / R2; // Fator para "desfazer" o divisor e obter Vout real do sensor
+const float ADC_MAX = 4095.0;        // ADC 12-bit no ESP32
+const float ADC_REF = 3.3;           // Referência típica do ADC
+const float V_OFFSET = 0.2;          // Offset (V) do modelo do sensor
+const float V_PER_KPA = 0.045;       // Sensibilidade: volts por kPa
+
+// ----------------------
+// Acelerador (potenciómetro)
+// ----------------------
+const int potPin = 27;               // ADC
+
+// ----------------------
+// CAN
+// ----------------------
+#define CAN_RX_PIN GPIO_NUM_17
+#define CAN_TX_PIN GPIO_NUM_16
+#define CAN_BAUDRATE 500000
+
+#define CAN_ID_SENSORS       0x123   // Frame com sensores (8 bytes)
+#define CAN_ID_REMOTE_START  0x124   // Frame start/ignição (1 byte)
+
+// Payload CAN (8 bytes) - empacotado para corresponder exatamente a 8 bytes do CAN clássico
+typedef struct __attribute__((packed))
+{
+  float tempC;              // 4 bytes
+  int16_t pressure_cbar;    // 2 bytes (pressão em centibar = bar * 100)
+  uint16_t throttle_permil; // 2 bytes (0..1000 = 0..100.0%)
+} CanSensorPayloadV2;
+
+// Garantia em tempo de compilação: tem de ocupar exatamente 8 bytes
+static_assert(sizeof(CanSensorPayloadV2) == 8, "Payload must be exactly 8 bytes");
+
+// ----------------------
+// Filas (queues) com o "último valor"
+// Cada fila tem tamanho 1 e é atualizada com xQueueOverwrite()
+// ----------------------
+static QueueHandle_t queueTemp;   // float
+static QueueHandle_t queuePress;  // int16_t
+static QueueHandle_t queueThr;    // uint16_t
+
+// Mutex para proteger escrita na Serial (evitar mensagens intercaladas entre tarefas)
+static SemaphoreHandle_t mutexSerial;
+
+// ----------------------
+// Estado partilhado (simples) do sistema
+// ----------------------
+static volatile bool startLatched = false; // "arranque" fica memorizado após primeiro ON
+static volatile bool ignitionOn = false;   // ignição ligada
+
+// Leitura do botão de ignição
+static inline bool ignitionPressed()
+{
+  return digitalRead(IGNITION_SWITCH_PIN) == LOW;
+}
+
+// Leitura e conversão do sensor de pressão para bar
+static float readPressureBar()
+{
+  int raw = analogRead(sensorPin);
+
+  // Converter ADC para tensão medida no pino
+  float Vadc = (raw / ADC_MAX) * ADC_REF;
+
+  // "Desfazer" o divisor resistivo para estimar a tensão real do sensor
+  float Vout = Vadc * undoRatio;
+
+  // Converter tensão para pressão (kPa) via modelo linear
+  float pressure_kPa = (Vout - V_OFFSET) / V_PER_KPA;
+
+  // Converter kPa para bar (1 bar = 100 kPa)
+  return pressure_kPa / 100.0f;
+}
+
+// Leitura do potenciómetro do acelerador e conversão para permil (0..1000)
+static uint16_t readThrottlePermil()
+{
+  int raw = analogRead(potPin);
+
+  // Converter ADC para percentagem (0..100)
+  float pct = (raw / ADC_MAX) * 100.0f;
+  if (pct < 0.0f) pct = 0.0f;
+  if (pct > 100.0f) pct = 100.0f;
+
+  // Converter percentagem para permil (0..1000) com arredondamento
+  uint32_t permil = (uint32_t)lroundf(pct * 10.0f);
+  if (permil > 1000u) permil = 1000u;
+  return (uint16_t)permil;
+}
+
+// ----------------------
+// Funções auxiliares do buzzer (LEDC)
+// ----------------------
+static void buzzerInit()
+{
+  // Anexa o pino a um canal LEDC com frequência inicial (2000 Hz) e resolução definida
+  (void)ledcAttach(BUZZER_PIN, 2000, BUZZER_LEDC_RES);
+  ledcWrite(BUZZER_PIN, 0); // começa desligado
+}
+
+static void buzzerTone(uint32_t freqHz)
+{
+  // Define a frequência e aplica duty para soar
+  ledcWriteTone(BUZZER_PIN, freqHz);
+  ledcWrite(BUZZER_PIN, BUZZER_DUTY_ON);
+}
+
+static void buzzerOff()
+{
+  // Desliga o buzzer (duty a 0) e remove frequência
+  ledcWrite(BUZZER_PIN, 0);
+  ledcWriteTone(BUZZER_PIN, 0);
+}
+
+// ----------------------
+// AX: tarefa do buzzer até existir ignição
+// - Faz uma sequência de bips até o utilizador premir o botão
+// - Depois marca ignitionOn e startLatched e termina (apaga-se)
+// ----------------------
+static void TaskAX_IgnitionBuzzer(void *parameter)
+{
+  (void)parameter;
+
+  const uint32_t shortBeepMs = 90, shortGapMs = 80, longBeepMs = 260, cycleGapMs = 500;
+  const uint32_t f1 = 1800, f2 = 2200;
+
+  // Enquanto o utilizador não "liga a ignição"
+  while (!ignitionPressed())
+  {
+    // 3 bips curtos alternando frequências
+    for (int i = 0; i < 3 && !ignitionPressed(); i++) {
+      buzzerTone((i % 2) ? f2 : f1);
+      vTaskDelay(pdMS_TO_TICKS(shortBeepMs));
+      buzzerOff();
+      vTaskDelay(pdMS_TO_TICKS(shortGapMs));
+    }
+    if (ignitionPressed()) break;
+
+    // 1 bip longo
+    buzzerTone(f2);
+    vTaskDelay(pdMS_TO_TICKS(longBeepMs));
+    buzzerOff();
+    vTaskDelay(pdMS_TO_TICKS(cycleGapMs));
+  }
+
+  // Ao ligar ignição
+  buzzerOff();
+  ignitionOn = true;
+  startLatched = true;
+
+  // Mensagem para debug (protegida por mutex)
+  if (xSemaphoreTake(mutexSerial, pdMS_TO_TICKS(20)) == pdTRUE) {
+    Serial.println("Ignition ON.");
+    xSemaphoreGive(mutexSerial);
+  }
+
+  vTaskDelete(NULL);
+}
+
+
+// ----------------------
+// AY: tarefa dos LEDs
+// - Sem ignição: LED vermelho pisca, LED azul desligado
+// - Com ignição: LED vermelho desligado, LED azul ligado
+// ----------------------
+static void TaskAY_Leds(void *parameter)
+{
+  (void)parameter;
+  bool red = false;
+
+  for (;;)
+  {
+    if (!ignitionOn) {
+      digitalWrite(RUN_LED_BLUE_PIN, LOW);
+
+      red = !red;
+      digitalWrite(IGNITION_LED_RED_PIN, red ? HIGH : LOW);
+      vTaskDelay(pdMS_TO_TICKS(RED_BLINK_PERIOD_MS));
+    } else {
+      digitalWrite(IGNITION_LED_RED_PIN, LOW);
+      digitalWrite(RUN_LED_BLUE_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// ----------------------
+// A1: tarefa de temperatura (500 ms)
+// - Lê DS18B20
+// - Guarda o último valor na fila queueTemp (float)
+// - Se sensor estiver desligado: coloca NAN
+// ----------------------
+static void TaskA1_Temperatura(void *parameter)
+{
+  (void)parameter;
+  for (;;)
+  {
+    sensors.requestTemperatures();
+    float tempC = sensors.getTempCByIndex(0);
+
+    bool ok = (tempC != DEVICE_DISCONNECTED_C);
+    float out = ok ? tempC : NAN;
+
+    xQueueOverwrite(queueTemp, &out);
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ----------------------
+// A2: tarefa de pressão (500 ms) com desfasamento inicial
+// - Espera 250 ms para não alinhar com a tarefa A1
+// - Converte bar -> centibar (bar * 100) em int16_t com saturação
+// ----------------------
+static void TaskA2_Pressao(void *parameter)
+{
+  (void)parameter;
+
+  // Desfasamento inicial
+  vTaskDelay(pdMS_TO_TICKS(250));
+
+  for (;;)
+  {
+    float bar = readPressureBar();
+
+    int32_t cbar = (int32_t)lroundf(bar * 100.0f); // bar -> centibar
+    if (cbar > INT16_MAX) cbar = INT16_MAX;
+    if (cbar < INT16_MIN) cbar = INT16_MIN;
+
+    int16_t out = (int16_t)cbar;
+    xQueueOverwrite(queuePress, &out);
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ----------------------
+// A3: tarefa do acelerador (100 ms)
+// - Lê potenciómetro e converte para permil 0..1000
+// - Guarda na fila queueThr
+// ----------------------
+static void TaskA3_Throttle(void *parameter)
+{
+  (void)parameter;
+  for (;;)
+  {
+    uint16_t thr = readThrottlePermil();
+    xQueueOverwrite(queueThr, &thr);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ----------------------
+// A4: tarefa CAN (10 Hz)
+// - Envia SEMPRE a frame "start flag" (0x124, 1 byte)
+// - Só envia frame de sensores (0x123, 8 bytes) quando ignitionOn == true
+// ----------------------
+static void TaskA4_CAN(void *parameter)
+{
+  (void)parameter;
+
+  // Frame: start/ignição (1 byte)
+  CAN_FRAME txStart{};
+  txStart.rtr = 0;
+  txStart.id = CAN_ID_REMOTE_START;
+  txStart.extended = false;
+  txStart.length = 1;
+
+  // Frame: sensores (8 bytes)
+  CAN_FRAME txSensors{};
+  txSensors.rtr = 0;
+  txSensors.id = CAN_ID_SENSORS;
+  txSensors.extended = false;
+  txSensors.length = sizeof(CanSensorPayloadV2);
+
+  // Valores locais usados para compor o payload
+  float tempC = NAN;
+  int16_t p_cbar = 0;
+  uint16_t thr = 0;
+
+  for (;;)
+  {
+    // Redundância: se o botão for premido, marca ignição ON
+    if (ignitionPressed()) { ignitionOn = true; startLatched = true; }
+
+    // Envia sempre a flag de arranque a 10 Hz
+    txStart.data.uint8[0] = startLatched ? 0x01 : 0x00;
+    (void)CAN0.sendFrame(txStart);
+
+    // Só envia sensores depois de ignitionOn
+    if (ignitionOn)
+    {
+      // Lê os últimos valores disponíveis (não bloqueia)
+      (void)xQueuePeek(queueTemp, &tempC, 0);
+      (void)xQueuePeek(queuePress, &p_cbar, 0);
+      (void)xQueuePeek(queueThr, &thr, 0);
+
+      // Prepara payload
+      CanSensorPayloadV2 payload{};
+      payload.tempC = tempC;
+      payload.pressure_cbar = p_cbar;
+      payload.throttle_permil = thr;
+
+      // Copia para o buffer CAN e envia
+      memcpy(txSensors.data.uint8, &payload, sizeof(payload));
+      (void)CAN0.sendFrame(txSensors);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Configuração de IO
+  pinMode(IGNITION_SWITCH_PIN, INPUT_PULLUP);
+  pinMode(IGNITION_LED_RED_PIN, OUTPUT);
+  pinMode(RUN_LED_BLUE_PIN, OUTPUT);
+  digitalWrite(IGNITION_LED_RED_PIN, LOW);
+  digitalWrite(RUN_LED_BLUE_PIN, LOW);
+
+  // Inicialização do buzzer
+  buzzerInit();
+
+  // Inicialização do sensor de temperatura
+  sensors.begin();
+
+  // Atenuação ADC (11 dB) para aumentar a gama de tensão medida
+  analogSetPinAttenuation(sensorPin, ADC_11db);
+  analogSetPinAttenuation(potPin, ADC_11db);
+
+  // Inicialização CAN
+  CAN0.setCANPins(CAN_RX_PIN, CAN_TX_PIN);
+  CAN0.enable();
+  CAN0.begin(CAN_BAUDRATE);
+  CAN0.watchFor();
+
+  // Mutex da Serial
+  mutexSerial = xSemaphoreCreateMutex();
+
+  // Filas (tamanho 1) para manter o último valor de cada sensor
+  queueTemp = xQueueCreate(1, sizeof(float));
+  queuePress = xQueueCreate(1, sizeof(int16_t));
+  queueThr = xQueueCreate(1, sizeof(uint16_t));
+
+  // "Seed" inicial (valores por omissão)
+  {
+    float t = NAN; xQueueOverwrite(queueTemp, &t);
+    int16_t p = 0; xQueueOverwrite(queuePress, &p);
+    uint16_t th = 0; xQueueOverwrite(queueThr, &th);
+  }
+
+  // Criação de tarefas (fixadas no core 1)
+  xTaskCreatePinnedToCore(TaskAX_IgnitionBuzzer, "AX_Ign", 3072, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskAY_Leds, "AY_Leds", 2048, NULL, 1, NULL, 1);
+
+  xTaskCreatePinnedToCore(TaskA1_Temperatura, "A1_Temp", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskA2_Pressao, "A2_Press", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskA3_Throttle, "A3_Thr", 2048, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskA4_CAN, "A4_CAN", 4096, NULL, 3, NULL, 1);
+
+  Serial.println("ESP32 A FULL ready (fixed).");
+}
+
+void loop()
+{
+
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
