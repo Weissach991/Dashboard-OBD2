@@ -1,0 +1,388 @@
+/*
+  ESP32 B – Scanner com Display (ILI9225)
+
+  Alertas (NÃO retidos / não “latched”) no display:
+    - TEMP > 16 °C => triângulo vermelho antes do valor + "ALERTA" à direita do valor
+    - Pressão < 1,2 bar quando Acel. > 40% => triângulo vermelho antes do valor + "ALERTA" à direita do valor
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <TFT_22_ILI9225.h>
+#include <esp32_can.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <math.h>
+#include <limits.h>
+
+// ---------------------- CAN ----------------------
+#define CAN_RX_PIN GPIO_NUM_17
+#define CAN_TX_PIN GPIO_NUM_16
+#define CAN_BAUDRATE 500000
+
+#define CAN_ID_SENSORS       0x123
+#define CAN_ID_REMOTE_START  0x124
+
+// ---------------------- TFT (ILI9225) ----------------------
+#define TFT_CS    15
+#define TFT_CD    25
+#define TFT_RST   26
+#define TFT_SDI   13
+#define TFT_CLK   14
+#define TFT_LED   -1
+
+TFT_22_ILI9225 tft = TFT_22_ILI9225(TFT_RST, TFT_CD, TFT_CS, TFT_SDI, TFT_CLK, TFT_LED);
+
+// ---------------------- Cores ----------------------
+#define COLOR_BLACK   0x0000
+#define COLOR_WHITE   0xFFFF
+#define COLOR_RED     0xF800
+#define COLOR_GREEN   0x07E0
+#define COLOR_BLUE    0x001F
+#define COLOR_YELLOW  0xFFE0
+
+// ---------------------- Timings ----------------------
+#define DISPLAY_PERIOD_MS 100
+#define ALERT_PERIOD_MS   500
+#define SENDER_TIMEOUT_MS 2000
+
+// ---------------------- Limiares de alerta ----------------------
+#define WARN_TEMP_C_THRESHOLD           16.0f
+#define WARN_PRESSURE_BAR_MIN           1.2f
+#define WARN_THROTTLE_PCT_FOR_PRESSURE  40.0f
+
+// Máscara de bits de aviso
+#define WARN_BIT_TEMP   (1u << 0)
+#define WARN_BIT_PRESS  (1u << 1)
+
+// Layout da interface
+#define WARN_TRI_X      2
+#define WARN_TRI_SIZE   10
+
+// Mantém os valores numéricos na mesma posição de antes
+#define VALUE_TEXT_X    10
+
+// Texto "ALERTA" mostrado à direita do valor
+
+#define ALERT_TEXT_X    120
+
+// Payload
+typedef struct __attribute__((packed))
+{
+  float tempC;
+  int16_t pressure_cbar;
+  uint16_t throttle_permil;
+} CanSensorPayloadV2;
+
+static_assert(sizeof(CanSensorPayloadV2) == 8, "O Payload V2 tem de ter exatamente 8 bytes");
+
+typedef struct {
+  uint32_t id;
+  uint8_t len;
+  uint8_t data[8];
+} CanRawMsg;
+
+// RTOS
+static QueueHandle_t queueCanRx;
+static SemaphoreHandle_t mutexData;
+
+// Estado
+static volatile bool startEnabled = false;
+static volatile uint32_t lastSeenMillis = 0;
+
+// Valores processados
+static float g_tempC = NAN;
+static float g_pressBar = 0.0f;
+static float g_thrPct = 0.0f;
+
+// Máscara de avisos atual
+static uint8_t g_warnMask = 0;
+
+// Auxiliares de cor
+static uint16_t tempColor(float tempC) {
+  if (tempC >= 16.0f) return COLOR_RED;
+  if (tempC >= 15.0f) return COLOR_GREEN;
+  return COLOR_BLUE;
+}
+static uint16_t throttleColor(float pct) {
+  if (pct >= 80.0f) return COLOR_RED;
+  if (pct >= 30.0f) return COLOR_YELLOW;
+  return COLOR_GREEN;
+}
+
+// Marcador em triângulo (apontado para a direita)
+static void drawWarnTriangle(uint16_t x, uint16_t y, uint16_t size, uint16_t color)
+{
+  uint16_t x0 = x;
+  uint16_t y0 = y;
+  uint16_t x1 = x;
+  uint16_t y1 = y + size;
+  uint16_t x2 = x + size;
+  uint16_t y2 = y + (size / 2);
+
+  tft.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+}
+
+static void drawThrottleBar(float throttle_pct)
+{
+  if (throttle_pct < 0.0f) throttle_pct = 0.0f;
+  if (throttle_pct > 100.0f) throttle_pct = 100.0f;
+
+  const uint16_t barX = 10;
+  const uint16_t barY = 160;
+  const uint16_t barW = tft.maxX() - 20;
+  const uint16_t barH = 14;
+
+  tft.drawRectangle(barX, barY, barX + barW, barY + barH, COLOR_WHITE);
+  tft.fillRectangle(barX + 1, barY + 1, barX + barW - 1, barY + barH - 1, COLOR_BLACK);
+
+  uint16_t fillW = (uint16_t)lroundf((throttle_pct / 100.0f) * (float)(barW - 2));
+  if (fillW > 0) {
+    tft.fillRectangle(barX + 1, barY + 1, barX + 1 + fillW, barY + barH - 1, throttleColor(throttle_pct));
+  }
+}
+
+// Display de arranque
+static void drawWaitScreen()
+{
+  tft.setBackgroundColor(COLOR_BLACK);
+  tft.clear();
+  tft.setFont(Terminal11x16);
+
+  const char *title = "Dashboard OBD2";
+  tft.drawText(10, 30, String(title), COLOR_WHITE);
+  tft.drawText(11, 31, String(title), COLOR_WHITE);
+
+  tft.drawText(10, 80, "Arranque o motor", COLOR_YELLOW);
+}
+
+// Display de funcionamento
+static void drawRunLabels()
+{
+  tft.setBackgroundColor(COLOR_BLACK);
+  tft.clear();
+  tft.setFont(Terminal11x16);
+
+  tft.drawText(0, 10, "Temperatura:", COLOR_WHITE);
+  tft.drawText(0, 70, "Pressao:", COLOR_WHITE);
+  tft.drawText(0, 120, "Posicao Acelerador:", COLOR_WHITE);
+}
+
+// Desenha os valores com triângulo + "ALERTA" à direita do valor
+static void drawRunValues(float tempC, float pressBar, float thrPct, uint8_t warnMask)
+{
+  uint16_t x2 = tft.maxX();
+
+  // Limpa as áreas dos valores
+  tft.fillRectangle(0, 32, x2, 52, COLOR_BLACK);
+  tft.fillRectangle(0, 92, x2, 112, COLOR_BLACK);
+  tft.fillRectangle(0, 142, x2, 154, COLOR_BLACK);
+
+  // Limpa a área do texto "ALERTA" (linhas de temperatura + pressão)
+  tft.fillRectangle(ALERT_TEXT_X, 32, x2, 52, COLOR_BLACK);
+  tft.fillRectangle(ALERT_TEXT_X, 92, x2, 112, COLOR_BLACK);
+
+  // ---------- Linha da temperatura ----------
+  const bool warnTemp = (warnMask & WARN_BIT_TEMP) != 0;
+  if (warnTemp) {
+    drawWarnTriangle(WARN_TRI_X, 34, WARN_TRI_SIZE, COLOR_RED);
+    tft.drawText(ALERT_TEXT_X, 32, "ALERTA", COLOR_RED);
+  }
+
+  char bufT[28];
+  snprintf(bufT, sizeof(bufT), "%.2f C", tempC);
+  tft.drawText(VALUE_TEXT_X, 32, String(bufT), tempColor(tempC));
+
+  // ---------- Linha da pressão ----------
+  const bool warnPress = (warnMask & WARN_BIT_PRESS) != 0;
+  if (warnPress) {
+    drawWarnTriangle(WARN_TRI_X, 94, WARN_TRI_SIZE, COLOR_RED);
+    tft.drawText(ALERT_TEXT_X, 92, "ALERTA", COLOR_RED);
+  }
+
+  char bufP[28];
+  snprintf(bufP, sizeof(bufP), "%.3f bar", pressBar);
+  tft.drawText(VALUE_TEXT_X, 92, String(bufP), COLOR_WHITE);
+
+  // ---------- Linha do acelerador ----------
+  char bufR[32];
+  snprintf(bufR, sizeof(bufR), "%.1f %%", thrPct);
+  tft.drawText(10, 142, String(bufR), throttleColor(thrPct));
+  drawThrottleBar(thrPct);
+}
+
+//Tarefa B1 – Receção e Descodificação CAN 
+static void TaskB1_CanRx(void *parameter)
+{
+  (void)parameter;
+  for (;;)
+  {
+    CAN_FRAME frame;
+    if (CAN0.read(frame)) {
+      CanRawMsg m{};
+      m.id = frame.id;
+      m.len = frame.length;
+      if (m.len > 8) m.len = 8;
+      memcpy(m.data, frame.data.byte, m.len);
+      (void)xQueueSend(queueCanRx, &m, 0);
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+}
+
+// Tarefa B2 – Processamento dos Dados Recebidos  
+static void TaskB2_Process(void *parameter)
+{
+  (void)parameter;
+  CanRawMsg m{};
+  for (;;)
+  {
+    if (xQueueReceive(queueCanRx, &m, portMAX_DELAY) == pdTRUE)
+    {
+      lastSeenMillis = millis();
+
+      if (m.id == CAN_ID_REMOTE_START && m.len >= 1) {
+        if (m.data[0] == 0x01 && !startEnabled) {
+          startEnabled = true;
+          drawRunLabels();
+        }
+        if (m.data[0] == 0x00 && startEnabled) {
+          startEnabled = false;
+          drawWaitScreen();
+        }
+        continue;
+      }
+
+      if (m.id == CAN_ID_SENSORS && m.len == sizeof(CanSensorPayloadV2)) {
+        if (!startEnabled) continue;
+
+        CanSensorPayloadV2 payload;
+        memcpy(&payload, m.data, sizeof(payload));
+
+        float tempC = payload.tempC;
+        float pressBar = ((float)payload.pressure_cbar) / 100.0f;
+
+        uint16_t thr = payload.throttle_permil;
+        if (thr > 1000u) thr = 1000u;
+        float thrPct = ((float)thr) / 10.0f;
+
+        if (xSemaphoreTake(mutexData, portMAX_DELAY) == pdTRUE) {
+          g_tempC = tempC;
+          g_pressBar = pressBar;
+          g_thrPct = thrPct;
+          xSemaphoreGive(mutexData);
+        }
+      }
+    }
+  }
+}
+
+// Atualização do Display (ILI9341)  
+static void TaskB3_Display(void *parameter)
+{
+  (void)parameter;
+  for (;;)
+  {
+    // Se o emissor deixar de enviar dados durante demasiado tempo, volta ao ecrã de espera
+    if (startEnabled && lastSeenMillis != 0 && (millis() - lastSeenMillis) > SENDER_TIMEOUT_MS) {
+      startEnabled = false;
+      drawWaitScreen();
+    }
+
+    if (startEnabled)
+    {
+      float tempC, pressBar, thrPct;
+      uint8_t warnMask;
+
+      if (xSemaphoreTake(mutexData, pdMS_TO_TICKS(10)) == pdTRUE) {
+        tempC = g_tempC;
+        pressBar = g_pressBar;
+        thrPct = g_thrPct;
+        warnMask = g_warnMask;
+        xSemaphoreGive(mutexData);
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+        continue;
+      }
+
+      drawRunValues(tempC, pressBar, thrPct, warnMask);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+  }
+}
+
+// Sistema de Avisos e Limiarização  
+static void TaskB4_Alerts(void *parameter)
+{
+  (void)parameter;
+  for (;;)
+  {
+    uint8_t newMask = 0;
+
+    if (startEnabled)
+    {
+      float tempC, pressBar, thrPct;
+      if (xSemaphoreTake(mutexData, pdMS_TO_TICKS(10)) == pdTRUE) {
+        tempC = g_tempC;
+        pressBar = g_pressBar;
+        thrPct = g_thrPct;
+
+        if (!isnan(tempC) && tempC > WARN_TEMP_C_THRESHOLD) {
+          newMask |= WARN_BIT_TEMP;
+        }
+
+        if (!isnan(pressBar) && !isnan(thrPct) &&
+            (thrPct > WARN_THROTTLE_PCT_FOR_PRESSURE) &&
+            (pressBar < WARN_PRESSURE_BAR_MIN)) {
+          newMask |= WARN_BIT_PRESS;
+        }
+
+        g_warnMask = newMask;
+        xSemaphoreGive(mutexData);
+      }
+    }
+    else
+    {
+      // Se não estiver em modo “run”, limpa os avisos
+      if (xSemaphoreTake(mutexData, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_warnMask = 0;
+        xSemaphoreGive(mutexData);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(ALERT_PERIOD_MS));
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  CAN0.setCANPins(CAN_RX_PIN, CAN_TX_PIN);
+  CAN0.enable();
+  CAN0.begin(CAN_BAUDRATE);
+  CAN0.watchFor();
+
+  tft.begin();
+  tft.setOrientation(1);
+  drawWaitScreen();
+
+  queueCanRx = xQueueCreate(32, sizeof(CanRawMsg));
+  mutexData = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(TaskB1_CanRx, "B1_CAN_RX", 4096, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(TaskB2_Process, "B2_PROC", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(TaskB3_Display, "B3_DISP", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(TaskB4_Alerts, "B4_ALERT", 2048, NULL, 1, NULL, 1);
+
+  Serial.println("ESP32 B pronto.");
+}
+
+void loop()
+{
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
